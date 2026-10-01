@@ -1,84 +1,95 @@
 #!/data/data/com.termux/files/usr/bin/bash
+#
+# ubuntu.sh — dựng container Ubuntu rootless trên Termux (thủ công).
+#
+# Các bước setup hệ thống mô phỏng proot-distro:
+#   - fake /proc, /sys stubs trong thư mục sysdata/
+#   - /dev/shm là thư mục sibling của rootfs (mode 1777), KHÔNG phải <rootfs>/tmp
+#   - /etc/resolv.conf và /etc/hosts được THAY THẾ (không append trùng)
+#   - chmod 0644 cho passwd/shadow/group/gshadow
+#   - đăng ký Android UID/GID (aid_*) idempotent
+#   - env identity: PD_CONTAINER, container=proot-distro
+#   - passthrough PROOT_VERBOSE / PROOT_DBG_STOPS từ môi trường người dùng
+#   - profile.d snippet sinh động, re-export biến khi `su -`
+#
+# Chạy: ./ubuntu.sh
 
-# === Check required packages ===
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FOLDER="SysUbuntu"
+ROOTFS="$SCRIPT_DIR/$FOLDER"
+SYSDATA_DIR="$SCRIPT_DIR/$FOLDER.sysdata"
+SHM_DIR="$SCRIPT_DIR/$FOLDER.shm"
+TARBALL="$SCRIPT_DIR/ubuntu-rootfs.tar.gz"
+TERMUX_USR="${PREFIX:-$HOME/../usr}"
+
+# In giá trị biến có tên $1 nếu đã set; trả về 1 nếu chưa set. An toàn với
+# `set -u` — khác ${!name} trực tiếp (báo lỗi "invalid indirect expansion").
+env_value() {
+	declare -p "$1" >/dev/null 2>&1 || return 1
+	printf '%s' "${!1}"
+}
+
+# === 1. Kiểm tra package bắt buộc ===
+# getent KHÔNG bắt buộc: Termux không cung cấp nó (util-linux không kèm),
+# và nó chỉ dùng để đặt tên nhóm — `id -G` đã phủ mọi GID bằng số.
+REQUIRED_CMDS=(wget proot pulseaudio tar termux-fix-shebang)
 missing=()
-for cmd in wget proot pulseaudio tar termux-fix-shebang; do
-	if ! command -v "$cmd" &>/dev/null; then
-		missing+=("$cmd")
-	fi
+for cmd in "${REQUIRED_CMDS[@]}"; do
+	command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 
-if [ ${#missing[@]} -gt 0 ]; then
-	echo "❌ Missing required packages: ${missing[*]}"
+if [ "${#missing[@]}" -gt 0 ]; then
+	echo "❌ Thiếu package cần thiết: ${missing[*]}"
 	echo ""
 	# Map command → package name
 	pkgs=()
 	for cmd in "${missing[@]}"; do
 		case "$cmd" in
 			termux-fix-shebang) pkgs+=("termux-tools") ;;
-			getent)             pkgs+=("util-linux") ;;
 			*)                  pkgs+=("$cmd") ;;
 		esac
 	done
-	echo "Run: pkg install ${pkgs[*]}"
+	echo "Chạy: pkg install ${pkgs[*]}"
 	echo ""
-	read -p "Install now? [y/N] " ans
+	read -r -p "Cài ngay? [y/N] " ans
 	if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
 		pkg install -y "${pkgs[@]}"
 	else
-		echo "Aborted."
+		echo "Đã huỷ."
 		exit 1
 	fi
 fi
 
-folder=SysUbuntu
-if [ -d "$folder" ]; then
-	first=1
-	echo "skipping downloading"
-fi
-tarball="ubuntu-rootfs.tar.gz"
-if [ "$first" != 1 ];then
-	if [ ! -f $tarball ]; then
-		echo "Download Rootfs, this may take a while base on your internet speed."
-		case `dpkg --print-architecture` in
-		aarch64)
-			archurl="arm64" ;;
-		arm)
-			archurl="armhf" ;;
-		amd64)
-			archurl="amd64" ;;
-		x86_64)
-			archurl="amd64" ;;	
-		i*86)
-			archurl="i386" ;;
-		x86)
-			archurl="i386" ;;
-		*)
-			echo "unknown architecture"; exit 1 ;;
-		esac
-		wget -c "http://localhost:8000/ubuntu-rootfs-${archurl}.tar.gz" -O $tarball
+# === 2. Tải và giải nén rootfs ===
+if [ -d "$ROOTFS" ]; then
+	echo "Đã có '$FOLDER', bỏ qua tải/giải nén."
+else
+	if [ ! -f "$TARBALL" ]; then
+		echo "Tải rootfs, có thể mất một lúc tuỳ tốc độ mạng."
+		echo "⚠️  Tải qua HTTP (không có checksum để xác minh) từ localhost:8000."
+		wget -c "http://localhost:8000/ubuntu-rootfs-arm64.tar.gz" -O "$TARBALL"
 	fi
-	cur=`pwd`
-	mkdir -p "$folder"
-	cd "$folder"
-	echo "Decompressing Rootfs, please be patient."
-	proot --link2symlink tar -xf ${cur}/${tarball}||:
-	cd "$cur"
+	mkdir -p "$ROOTFS"
+	echo "Giải nén rootfs, vui lòng chờ."
+	if ! proot --link2symlink tar -xf "$TARBALL" -C "$ROOTFS"; then
+		echo "❌ Giải nén thất bại — rootfs có thể hỏng. Xoá '$ROOTFS' rồi thử lại."
+		exit 1
+	fi
 fi
 
-# === Fake sysdata (like proot-distro) ===
-sysdata_dir="${folder}.sysdata"
-mkdir -p "$sysdata_dir"
-mkdir -p "$sysdata_dir/sys_empty"
-chmod 700 "$sysdata_dir"
+# === 3. Fake sysdata (giống proot-distro) ===
+mkdir -p "$SYSDATA_DIR/sys_empty"
+chmod 700 "$SYSDATA_DIR"
 
-echo "0.12 0.07 0.02 2/165 765" > "$sysdata_dir/loadavg"
-echo "65534" > "$sysdata_dir/sysctl_kernel_overflowuid"
-echo "65534" > "$sysdata_dir/sysctl_kernel_overflowgid"
-echo "40" > "$sysdata_dir/sysctl_entry_cap_last_cap"
-echo "4096" > "$sysdata_dir/sysctl_inotify_max_user_watches"
+printf '0.12 0.07 0.02 2/165 765\n' > "$SYSDATA_DIR/loadavg"
+printf '65534\n' > "$SYSDATA_DIR/sysctl_kernel_overflowuid"
+printf '65534\n' > "$SYSDATA_DIR/sysctl_kernel_overflowgid"
+printf '40\n' > "$SYSDATA_DIR/sysctl_entry_cap_last_cap"
+printf '4096\n' > "$SYSDATA_DIR/sysctl_inotify_max_user_watches"
 
-cat > "$sysdata_dir/stat" << 'SYSEOF'
+cat > "$SYSDATA_DIR/stat" << 'SYSEOF'
 cpu  1957 0 2877 93280 262 342 254 87 0 0
 cpu0 31 0 226 12027 82 10 4 9 0 0
 cpu1 45 0 664 11144 21 263 233 12 0 0
@@ -88,7 +99,7 @@ cpu4 295 0 268 11772 10 12 2 12 0 0
 cpu5 270 0 251 11833 15 3 1 10 0 0
 cpu6 430 0 520 11386 30 8 1 12 0 0
 cpu7 30 0 172 12108 50 8 1 13 0 0
-intr 127541 38 290 0 0 0 0 4 0 1 0 0 25329 258 0 5777 277 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+intr 127541 38 290 0 0 0 0 4 0 1 0 0 25329 258 0 5777 277 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 ctxt 140223
 btime 1680020856
 processes 772
@@ -97,7 +108,7 @@ procs_blocked 0
 softirq 75663 0 5903 6 25375 10774 0 243 11685 0 21677
 SYSEOF
 
-cat > "$sysdata_dir/vmstat" << 'VSEOF'
+cat > "$SYSDATA_DIR/vmstat" << 'VSEOF'
 nr_free_pages 1743136
 nr_zone_inactive_anon 179281
 nr_zone_active_anon 7183
@@ -278,11 +289,18 @@ direct_map_level3_splits 0
 nr_unstable 0
 VSEOF
 
-echo "124.08 932.80" > "$sysdata_dir/uptime"
-echo "Linux version 6.17.0-PRoot-Distro (proot@termux) (gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) #1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000" > "$sysdata_dir/version"
+printf '124.08 932.80\n' > "$SYSDATA_DIR/uptime"
+printf 'Linux version 6.17.0-PRoot-Distro (proot@termux) (gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) #1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000\n' > "$SYSDATA_DIR/version"
 
-# === /etc/hosts ===
-cat > "$folder/etc/hosts" << 'HSEOF'
+# === 4. /dev/shm là thư mục sibling (mode 1777), không phải <rootfs>/tmp ===
+# proot phân giải nguồn bind theo TÊN khi mount, sau khi mọi kiểm tra đã xong;
+# guest đổi <rootfs>/tmp thành symlink sẽ khiến phiên sau mount nhầm thư mục host.
+mkdir -p "$SHM_DIR"
+chmod 1777 "$SHM_DIR"
+
+# === 5. /etc/hosts và /etc/resolv.conf (THAY THẾ, không append) ===
+mkdir -p "$ROOTFS/etc"
+cat > "$ROOTFS/etc/hosts" << 'HSEOF'
 # IPv4.
 127.0.0.1   localhost.localdomain localhost
 
@@ -295,26 +313,143 @@ ff02::2     ip6-allrouters
 ff02::3     ip6-allhosts
 HSEOF
 
-mkdir -p "$folder/etc/profile.d"
-mkdir -p "$folder/etc/dpkg/dpkg.cfg.d"
-echo 'force-unsafe-io' > "$folder/etc/dpkg/dpkg.cfg.d/unsafe-io"
+# Ghi đè hoàn toàn để chạy lại không nhân đôi nameserver.
+rm -f "$ROOTFS/etc/resolv.conf"
+cat > "$ROOTFS/etc/resolv.conf" << 'RSEOF'
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+RSEOF
 
-bin=start-ubuntu.sh
-echo "writing launch script"
-cat > $bin <<- EOM
+# === 6. Cấu hình dpkg / apt ===
+mkdir -p "$ROOTFS/etc/profile.d"
+mkdir -p "$ROOTFS/etc/dpkg/dpkg.cfg.d"
+echo 'force-unsafe-io' > "$ROOTFS/etc/dpkg/dpkg.cfg.d/unsafe-io"
+mkdir -p "$ROOTFS/etc/apt/apt.conf.d"
+cat > "$ROOTFS/etc/apt/apt.conf.d/99lean" << 'APEOF'
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APEOF
+
+# === 7. chmod id files + đăng ký Android UID/GID (idempotent) ===
+# proot-distro chmod 0644 bốn file id để login đọc được passwd/group.
+for f in passwd shadow group gshadow; do
+	[ -f "$ROOTFS/etc/$f" ] && chmod 0644 "$ROOTFS/etc/$f"
+done
+
+termux_uid="$(id -u)"
+termux_gid="$(id -g)"
+termux_user="$(id -un)"
+primary_group="$(id -ng)"
+
+# Thêm một dòng vào file nếu chưa có — chạy lại không nhân đôi entry.
+append_once() {
+	local file="$1" line="$2"
+	[ -f "$file" ] || return 0
+	grep -qxF "$line" "$file" && return 0
+	printf '%s\n' "$line" >> "$file"
+}
+
+append_once "$ROOTFS/etc/passwd" "aid_${termux_user}:x:${termux_uid}:${termux_gid}:Termux:/:/sbin/nologin"
+append_once "$ROOTFS/etc/shadow" "aid_${termux_user}:*:18446:0:99999:7:::"
+append_once "$ROOTFS/etc/group" "aid_${primary_group}:x:${termux_gid}:root,aid_${termux_user}"
+[ -f "$ROOTFS/etc/gshadow" ] && append_once "$ROOTFS/etc/gshadow" "aid_${primary_group}:*::root,aid_${termux_user}"
+
+# Nhóm phụ (dedup theo gid).
+# Phase 1: đặt tên nhóm qua getent nếu có (getent không bắt buộc trên Termux).
+seen_gids=" $termux_gid "
+if command -v getent >/dev/null 2>&1; then
+	for gname in $(id -nG 2>/dev/null); do
+		[ "$gname" = "$primary_group" ] && continue
+		gid="$(getent group "$gname" 2>/dev/null | cut -d: -f3)"
+		[ -n "$gid" ] || continue
+		case "$seen_gids" in *" $gid "*) continue ;; esac
+		seen_gids="$seen_gids$gid "
+		append_once "$ROOTFS/etc/group" "aid_${gname}:x:${gid}:root,aid_${termux_user}"
+		[ -f "$ROOTFS/etc/gshadow" ] && append_once "$ROOTFS/etc/gshadow" "aid_${gname}:*::root,aid_${termux_user}"
+	done
+fi
+# Phase 2: các GID chưa đặt tên (nhóm đặc thù Android) — dùng số.
+for gid in $(id -G 2>/dev/null); do
+	case "$seen_gids" in *" $gid "*) continue ;; esac
+	seen_gids="$seen_gids$gid "
+	append_once "$ROOTFS/etc/group" "aid_${gid}:x:${gid}:root,aid_${termux_user}"
+	[ -f "$ROOTFS/etc/gshadow" ] && append_once "$ROOTFS/etc/gshadow" "aid_${gid}:*::root,aid_${termux_user}"
+done
+
+# === 8. profile.d snippet (sinh động, giống proot-distro) ===
+# Login shell source /etc/profile nên mất biến do proot truyền; snippet này
+# re-export để `su - user` vẫn giữ. Bỏ qua biến per-session và proot-internal.
+LEGACY_SNIPPET="$ROOTFS/etc/profile.d/termux-prefix.sh"
+[ -e "$LEGACY_SNIPPET" ] && rm -f "$LEGACY_SNIPPET"
+
+SNIPPET="$ROOTFS/etc/profile.d/termux-profile.sh"
+PROFILE_PAIRS=(
+	"LANG=C.UTF-8"
+	"TZ=Asia/Ho_Chi_Minh"
+	"MOZ_FAKE_NO_SANDBOX=1"
+	"PULSE_SERVER=127.0.0.1"
+	"PD_CONTAINER=$FOLDER"
+	"container=proot-distro"
+)
+for _e in ANDROID_ART_ROOT ANDROID_DATA ANDROID_I18N_ROOT ANDROID_ROOT \
+          ANDROID_RUNTIME_ROOT ANDROID_TZDATA_ROOT BOOTCLASSPATH \
+          DEX2OATBOOTCLASSPATH EXTERNAL_STORAGE; do
+	if _v="$(env_value "$_e")"; then
+		[ -n "$_v" ] && PROFILE_PAIRS+=("$_e=$_v")
+	fi
+done
+
+{
+	# Không export PATH (giữ nguyên baseline trong env của proot, không chèn
+	# bin Termux) — chỉ re-export các biến bên dưới.
+	for pair in "${PROFILE_PAIRS[@]}"; do
+		key="${pair%%=*}"
+		val="${pair#*=}"
+		# Tên biến không hợp lệ (space, ;, quote…) sẽ làm hỏng snippet khi
+		# /etc/profile source nó — bỏ qua thay vì ghi dòng phá mọi shell sau.
+		[[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+		escaped="${val//\'/\'\\\'\'}"
+		printf "export %s='%s'\n" "$key" "$escaped"
+	done
+} > "$SNIPPET"
+chmod 644 "$SNIPPET"
+
+# === 9. Sinh launch script ===
+bin="start-ubuntu.sh"
+echo "Đang ghi launch script..."
+# Heredoc dùng 'EOM' (không expand biến), nên các giá trị phụ thuộc môi trường
+# được ghi dưới dạng placeholder @FOLDER@/@TERMUX_PREFIX@/@TERMUX_HOME@ và
+# thay bằng sed ngay sau khi ghi.
+cat > "$SCRIPT_DIR/$bin" << 'EOM'
 #!/data/data/com.termux/files/usr/bin/bash
-SCRIPT_DIR="\$(cd \$(dirname \$0) && pwd)"
-ROOTFS="\$SCRIPT_DIR/${folder}"
-sysdata_dir="\$SCRIPT_DIR/${folder}.sysdata"
+# start-ubuntu.sh — sinh bởi ubuntu.sh. Chạy container Ubuntu rootless.
+set -u
 
-pulseaudio --start
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOTFS="$SCRIPT_DIR/@FOLDER@"
+SYSDATA_DIR="$SCRIPT_DIR/@FOLDER@.sysdata"
+SHM_DIR="$SCRIPT_DIR/@FOLDER@.shm"
+
+# In giá trị biến có tên $1 nếu đã set; trả về 1 nếu chưa set. An toàn với
+# `set -u` — khác ${!name} trực tiếp (báo lỗi "invalid indirect expansion").
+env_value() {
+	declare -p "$1" >/dev/null 2>&1 || return 1
+	printf '%s' "${!1}"
+}
+
+# --- Thư mục host-side (mode đặt trên thư mục thật) ---
+mkdir -p "$ROOTFS/.l2s"
+mkdir -p "$ROOTFS/tmp" && chmod 1777 "$ROOTFS/tmp"
+mkdir -p "$ROOTFS/tmp/claude-messaging" && chmod 0700 "$ROOTFS/tmp/claude-messaging"
+# /dev/shm lấy từ thư mục sibling của rootfs, không phải <rootfs>/tmp.
+mkdir -p "$SHM_DIR" && chmod 1777 "$SHM_DIR"
+
+UNAME_M="$(uname -m 2>/dev/null || echo aarch64)"
+
+pulseaudio --start 2>/dev/null || true
 unset LD_PRELOAD
 
-mkdir -p "\$ROOTFS/.l2s"
-mkdir -p "\$ROOTFS/tmp" && chmod 1777 "\$ROOTFS/tmp"
-mkdir -p "\$ROOTFS/tmp/claude-messaging" && chmod 0700 "\$ROOTFS/tmp/claude-messaging"
-
-# Build env for proot (like proot-distro's child_env — set in proot's env, not in guest via env -i)
+# --- env cho proot (đặt trong env của proot, không dùng env -i cho guest) ---
 env=()
 env+=(HOME=/root)
 env+=(PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games)
@@ -325,168 +460,132 @@ env+=(COLORTERM=truecolor)
 env+=(TZ=Asia/Ho_Chi_Minh)
 env+=(MOZ_FAKE_NO_SANDBOX=1)
 env+=(PULSE_SERVER=127.0.0.1)
-env+=(PROOT_L2S_DIR="\$ROOTFS/.l2s")
+env+=(PROOT_L2S_DIR="$ROOTFS/.l2s")
 env+=(PROOT_NO_SECCOMP=1)
-# Android env vars from host
-for _e in ANDROID_ART_ROOT ANDROID_DATA ANDROID_I18N_ROOT ANDROID_ROOT ANDROID_RUNTIME_ROOT ANDROID_TZDATA_ROOT BOOTCLASSPATH DEX2OATBOOTCLASSPATH EXTERNAL_STORAGE; do
-	[ -n "\${!_e}" ] && env+=("\$_e=\${!_e}")
+# Identity: cho guest biết nó đang chạy ở đâu.
+env+=(PD_CONTAINER=@FOLDER@)
+env+=(container=proot-distro)
+# Passthrough biến debug proot do người dùng đặt (chỉ khi có giá trị).
+for _v in PROOT_VERBOSE PROOT_DBG_STOPS; do
+	if _val="$(env_value "$_v")"; then
+		[ -n "$_val" ] && env+=("$_v=$_val")
+	fi
+done
+# Android host vars.
+for _e in ANDROID_ART_ROOT ANDROID_DATA ANDROID_I18N_ROOT ANDROID_ROOT \
+          ANDROID_RUNTIME_ROOT ANDROID_TZDATA_ROOT BOOTCLASSPATH \
+          DEX2OATBOOTCLASSPATH EXTERNAL_STORAGE; do
+	if _val="$(env_value "$_e")"; then
+		[ -n "$_val" ] && env+=("$_e=$_val")
+	fi
 done
 
-# Build proot args array (preserves backslashes in kernel-release)
-p_args=($(command -v proot))
+# --- proot args ---
+p_args=("$(command -v proot)")
 p_args+=(--kill-on-exit)
 p_args+=(--link2symlink)
 p_args+=(--sysvipc)
 p_args+=(-L)
 p_args+=(--change-id=0:0)
-p_args+=(--rootfs="\$ROOTFS")
+p_args+=(--rootfs="$ROOTFS")
 p_args+=(--cwd=/root)
 p_args+=(--bind=/dev)
 p_args+=(--bind=/dev/urandom:/dev/random)
-if [ ! -e /dev/fd ]; then p_args+=(--bind=/proc/self/fd:/dev/fd); fi
-if [ ! -e /dev/stdin ]; then p_args+=(--bind=/proc/self/fd/0:/dev/stdin); fi
-if [ ! -e /dev/stdout ]; then p_args+=(--bind=/proc/self/fd/1:/dev/stdout); fi
-if [ ! -e /dev/stderr ]; then p_args+=(--bind=/proc/self/fd/2:/dev/stderr); fi
+[ ! -e /dev/fd ] && p_args+=(--bind=/proc/self/fd:/dev/fd)
+[ ! -e /dev/stdin ] && p_args+=(--bind=/proc/self/fd/0:/dev/stdin)
+[ ! -e /dev/stdout ] && p_args+=(--bind=/proc/self/fd/1:/dev/stdout)
+[ ! -e /dev/stderr ] && p_args+=(--bind=/proc/self/fd/2:/dev/stderr)
 p_args+=(--bind=/proc)
 p_args+=(--bind=/sys)
-# Fake /proc bindings for Android restricted paths
+# Fake /proc bindings cho các đường dẫn Android chặn.
 for _f in loadavg stat uptime version vmstat; do
-	if [ ! -r "/proc/\$_f" ]; then
-		p_args+=(--bind="\$sysdata_dir/\$_f:/proc/\$_f")
-	fi
+	[ ! -r "/proc/$_f" ] && p_args+=(--bind="$SYSDATA_DIR/$_f:/proc/$_f")
 done
 for _f in "entry_cap_last_cap:kernel/cap_last_cap" "inotify_max_user_watches:fs/inotify/max_user_watches" "kernel_overflowuid:kernel/overflowuid" "kernel_overflowgid:kernel/overflowgid"; do
-	_sname="\${_f%%:*}"
-	_ppath="\${_f#*:}"
-	if [ ! -r "/proc/sys/\$_ppath" ]; then
-		p_args+=(--bind="\$sysdata_dir/sysctl_\$_sname:/proc/sys/\$_ppath")
-	fi
+	_sname="${_f%%:*}"
+	_ppath="${_f#*:}"
+	[ ! -r "/proc/sys/$_ppath" ] && p_args+=(--bind="$SYSDATA_DIR/sysctl_$_sname:/proc/sys/$_ppath")
 done
+p_args+=(--bind="$SYSDATA_DIR/sys_empty:/sys/fs/selinux")
 
-p_args+=(--bind="\$sysdata_dir/sys_empty:/sys/fs/selinux")
-
-# Dalvik/ART caches
+# Dalvik/ART caches.
 for _d in /data/app /data/dalvik-cache /data/misc/apexdata/com.android.art/dalvik-cache; do
-	if [ -d "\$_d" ] && [ -x "\$_d" ]; then
-		p_args+=(--bind="\$_d")
-	fi
+	[ -d "$_d" ] && [ -x "$_d" ] && p_args+=(--bind="$_d")
 done
-# Storage
+# Shared storage.
 if [ -r /storage ]; then
 	p_args+=(--bind=/storage)
-	if [ -r /storage/emulated/0 ]; then
-		p_args+=(--bind=/storage/emulated/0:/sdcard)
-#p_args+=(--bind=/storage/emulated/0:/mnt/sdcard)
-	fi
+	[ -r /storage/emulated/0 ] && p_args+=(--bind=/storage/emulated/0:/sdcard)
 else
 	for _p in /storage/self/primary /storage/emulated/0 /sdcard; do
-		if [ -r "\$_p" ]; then
-#			p_args+=(--bind="\$_p":/mnt/sdcard)
-			p_args+=(--bind="\$_p":/sdcard)
-#			p_args+=(--bind="\$_p":/storage/emulated/0)
-#			p_args+=(--bind="\$_p":/storage/self/primary)
+		if [ -r "$_p" ]; then
+			p_args+=(--bind="${_p}:/sdcard")
 			break
 		fi
 	done
 fi
-# Android system paths
+# Android system paths.
 for _p in /apex /odm /product /system /system_ext /vendor /linkerconfig/ld.config.txt /linkerconfig/com.android.art/ld.config.txt /plat_property_contexts /property_contexts; do
-	if [ -e "\$_p" ]; then
-		p_args+=(--bind="\$_p")
-	fi
+	[ -e "$_p" ] && p_args+=(--bind="$_p")
 done
-# Termux app paths
-if [ -d /data/data/com.termux/files/apps ]; then
-	p_args+=(--bind=/data/data/com.termux/files/apps)
-fi
-p_args+=(--bind=/data/data/com.termux/cache)
-p_args+=(--bind=/data/data/com.termux/files/home)
-p_args+=(--bind=/data/data/com.termux/files/usr)
-# /dev/shm (tmp inside rootfs)
-p_args+=(--bind="\$ROOTFS/tmp:/dev/shm")
-# Kernel release (proot format)
+# Termux app paths.
+[ -d @TERMUX_PREFIX@/../apps ] && p_args+=(--bind=@TERMUX_PREFIX@/../apps)
+p_args+=(--bind=@TERMUX_PREFIX@/../cache)
+p_args+=(--bind=@TERMUX_HOME@)
+p_args+=(--bind=@TERMUX_PREFIX@)
+# /dev/shm = thư mục sibling (KHÔNG phải $ROOTFS/tmp).
+p_args+=(--bind="$SHM_DIR:/dev/shm")
+# Kernel release (định dạng proot).
 HNAME=wizk
-UNAME_M=\$(uname -m 2>/dev/null || echo aarch64)
-kr="\\\\Linux\\\\\${HNAME}\\\\6.6.89-wizkvn-100067\\\\#1 SMP PREEMPT Sat Jul 19 00:22:46 +07 2026\\\\\${UNAME_M}\\\\localdomain\\\\-1\\\\"
-p_args+=(--kernel-release="\${kr}")
+kr="\\Linux\\${HNAME}\\6.6.89-wizkvn-100067\\#1 SMP PREEMPT Sat Jul 19 00:22:46 +07 2026\\${UNAME_M}\\localdomain\\-1\\"
+p_args+=(--kernel-release="${kr}")
 p_args+=(/bin/bash --login)
 
-if [ \$# -eq 0 ]; then
-	exec env -i "\${env[@]}" "\${p_args[@]}"
+if [ "$#" -eq 0 ]; then
+	exec env -i "${env[@]}" "${p_args[@]}"
 else
-	exec env -i "\${env[@]}" "\${p_args[@]}" -c "\$*"
+	exec env -i "${env[@]}" "${p_args[@]}" -c "$(printf '%q ' "$@")"
 fi
 EOM
 
-echo "Setting up pulseaudio so you can have music in distro."
+# Thay placeholder trong launch script. Escape & và | để tên thư mục lạ không
+# phá sed; TERMUX_HOME phải thay trước vì là tiền tố của TERMUX_PREFIX.
+# Escape ký tự & và | để an toàn khi nhúng vào biểu thức sed
+sed_esc() { printf '%s' "$1" | sed 's/[&|]/\\&/g'; }
+_termux_prefix_esc="$(sed_esc "${PREFIX:-/data/data/com.termux/files/usr}")"
+_termux_home_esc="$(sed_esc "${HOME:-/data/data/com.termux/files/home}")"
+sed -i \
+	-e "s|@FOLDER@|$(sed_esc "$FOLDER")|g" \
+	-e "s|@TERMUX_HOME@|$_termux_home_esc|g" \
+	-e "s|@TERMUX_PREFIX@|$_termux_prefix_esc|g" \
+	"$SCRIPT_DIR/$bin"
 
-if grep -q "anonymous" ~/../usr/etc/pulse/default.pa;then
-    echo "module already present"
+# === 10. Pulseaudio (giống bản gốc, idempotent) ===
+echo "Cấu hình pulseaudio để có âm thanh trong distro."
+PA_DEFAULT="$TERMUX_USR/etc/pulse/default.pa"
+if [ -f "$PA_DEFAULT" ] && ! grep -q "module-native-protocol-tcp" "$PA_DEFAULT"; then
+	echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" >> "$PA_DEFAULT"
+	echo "Đã bật module pulseaudio TCP."
 else
-    echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" >> ~/../usr/etc/pulse/default.pa
+	echo "Module đã có hoặc thiếu default.pa — bỏ qua."
 fi
 
-# Dynamic Android UID/GID registration (like proot-distro)
-termux_uid=$(id -u)
-termux_gid=$(id -g)
-termux_user=$(id -un)
+PA_DAEMON="$TERMUX_USR/etc/pulse/daemon.conf"
+if [ -f "$PA_DAEMON" ] && ! grep -q "^exit-idle-time" "$PA_DAEMON"; then
+	echo "exit-idle-time = -1" >> "$PA_DAEMON"
+	echo "Đặt pulseaudio timeout = vô hạn."
+fi
 
-echo "aid_${termux_user}:x:${termux_uid}:${termux_gid}:Termux:/:/sbin/nologin" >> "$folder/etc/passwd"
-echo "aid_${termux_user}:*:18446:0:99999:7:::" >> "$folder/etc/shadow"
+PA_CLIENT="$TERMUX_USR/etc/pulse/client.conf"
+if [ -f "$PA_CLIENT" ] && ! grep -q "^autospawn" "$PA_CLIENT"; then
+	echo "autospawn = no" >> "$PA_CLIENT"
+	echo "Đã tắt pulseaudio autospawn."
+fi
 
-# Primary group
-primary_group=$(id -ng)
-echo "aid_${primary_group}:x:${termux_gid}:root,aid_${termux_user}" >> "$folder/etc/group"
-[ -f "$folder/etc/gshadow" ] && echo "aid_${primary_group}:*::root,aid_${termux_user}" >> "$folder/etc/gshadow"
-
-# Supplementary groups (deduplicated)
-# Phase 1: groups resolvable by name
-seen_gids=""
-for gname in $(id -nG 2>/dev/null); do
-	[ "$gname" = "$primary_group" ] && continue
-	gid=$(getent group "$gname" 2>/dev/null | cut -d: -f3)
-	[ -z "$gid" ] && continue
-	case "$seen_gids" in
-		*"$gid"*) continue ;;
-	esac
-	seen_gids="$seen_gids $gid"
-	echo "aid_${gname}:x:${gid}:root,aid_${termux_user}" >> "$folder/etc/group"
-	[ -f "$folder/etc/gshadow" ] && echo "aid_${gname}:*::root,aid_${termux_user}" >> "$folder/etc/gshadow"
-done
-# Phase 2: numeric GIDs not resolved above (Android-specific groups)
-for gid in $(id -G 2>/dev/null); do
-	[ "$gid" = "$termux_gid" ] && continue
-	case "$seen_gids" in
-		*"$gid"*) continue ;;
-	esac
-	seen_gids="$seen_gids $gid"
-	echo "aid_${gid}:x:${gid}:root,aid_${termux_user}" >> "$folder/etc/group"
-	[ -f "$folder/etc/gshadow" ] && echo "aid_${gid}:*::root,aid_${termux_user}" >> "$folder/etc/gshadow"
-done
-echo "nameserver 8.8.8.8" >> "$folder/etc/resolv.conf"
-echo "nameserver 8.8.4.4" >> "$folder/etc/resolv.conf"
-echo 'APT::Install-Recommends "false";' > "$folder/etc/apt/apt.conf.d/99lean"
-echo 'APT::Install-Suggests "false";'  >> "$folder/etc/apt/apt.conf.d/99lean"
-echo "exit-idle-time = -1" >> ~/../usr/etc/pulse/daemon.conf
-echo "Modified pulseaudio timeout to infinite"
-echo "autospawn = no" >> ~/../usr/etc/pulse/client.conf
-echo "Disabled pulseaudio autospawn"
-# === Profile.d injection (like proot-distro) ===
-cat > "$folder/etc/profile.d/termux-profile.sh" << 'TPEOF'
-#case ":${PATH}:" in
-#  *":/data/data/com.termux/files/usr/bin:"*) ;;
-#  *) export PATH="${PATH}:/data/data/com.termux/files/usr/bin" ;;
-#esac
-export PULSE_SERVER=127.0.0.1
-export MOZ_FAKE_NO_SANDBOX=1
-TPEOF
-chmod 644 "$folder/etc/profile.d/termux-profile.sh"
-#echo "Injected termux-profile.sh"
-
-echo "fixing shebang of $bin"
-termux-fix-shebang $bin
-echo "making $bin executable"
-chmod +x $bin
-echo "removing image for some space"
-rm $tarball
-echo "You can now launch Ubuntu with the ./${bin} script"
+# === 11. Hoàn tất ===
+echo "Sửa shebang cho $bin"
+termux-fix-shebang "$SCRIPT_DIR/$bin"
+chmod +x "$SCRIPT_DIR/$bin"
+echo "Xoá tarball để tiết kiệm dung lượng"
+rm -f "$TARBALL"
+echo "Bạn có thể chạy Ubuntu bằng: ./$bin"
