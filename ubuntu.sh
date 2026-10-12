@@ -23,7 +23,27 @@ ROOTFS="$SCRIPT_DIR/$FOLDER"
 SYSDATA_DIR="$SCRIPT_DIR/$FOLDER.sysdata"
 SHM_DIR="$SCRIPT_DIR/$FOLDER.shm"
 TARBALL="$SCRIPT_DIR/ubuntu-rootfs.tar.gz"
-TERMUX_USR="${PREFIX:-$HOME/../usr}"
+
+# --- Log có màu, tiền tố [*] / [+] / [!] ---
+# Màu tự tắt khi đầu ra không phải terminal hoặc khi đặt NO_COLOR.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_RST=$'\033[0m'; C_BLD=$'\033[1m'; C_DIM=$'\033[2m'
+	C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+	C_BLU=$'\033[34m'; C_CYN=$'\033[36m'
+else
+	C_RST=; C_BLD=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_CYN=
+fi
+
+# In bước đang chạy.
+log_step() { printf '%s[*]%s %s\n' "$C_BLU$C_BLD" "$C_RST" "$*"; }
+# In thông tin phụ (thụt lề).
+log_info() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
+# In thông báo thành công.
+log_ok()   { printf '%s[+]%s %s\n' "$C_GRN$C_BLD" "$C_RST" "$*"; }
+# In cảnh báo.
+log_warn() { printf '%s[!]%s %s\n' "$C_YEL$C_BLD" "$C_RST" "$*"; }
+# In lỗi (ra stderr).
+log_err()  { printf '%s[!]%s %s\n' "$C_RED$C_BLD" "$C_RST" "$*" >&2; }
 
 # In giá trị biến có tên $1 nếu đã set; trả về 1 nếu chưa set. An toàn với
 # `set -u` — khác ${!name} trực tiếp (báo lỗi "invalid indirect expansion").
@@ -35,14 +55,14 @@ env_value() {
 # === 1. Kiểm tra package bắt buộc ===
 # getent KHÔNG bắt buộc: Termux không cung cấp nó (util-linux không kèm),
 # và nó chỉ dùng để đặt tên nhóm — `id -G` đã phủ mọi GID bằng số.
-REQUIRED_CMDS=(wget proot pulseaudio tar termux-fix-shebang)
+REQUIRED_CMDS=(wget proot tar termux-fix-shebang)
 missing=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
 	command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 
 if [ "${#missing[@]}" -gt 0 ]; then
-	echo "❌ Thiếu package cần thiết: ${missing[*]}"
+	log_err "Thiếu package cần thiết: ${missing[*]}"
 	echo ""
 	# Map command → package name
 	pkgs=()
@@ -52,35 +72,35 @@ if [ "${#missing[@]}" -gt 0 ]; then
 			*)                  pkgs+=("$cmd") ;;
 		esac
 	done
-	echo "Chạy: pkg install ${pkgs[*]}"
+	log_info "Chạy: pkg install ${pkgs[*]}"
 	echo ""
 	read -r -p "Cài ngay? [y/N] " ans
 	if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
 		pkg install -y "${pkgs[@]}"
 	else
-		echo "Đã huỷ."
+		log_warn "Đã huỷ."
 		exit 1
 	fi
 fi
 
 # === 2. Tải và giải nén rootfs ===
 if [ -d "$ROOTFS" ]; then
-	echo "Đã có '$FOLDER', bỏ qua tải/giải nén."
+	log_ok "Đã có '$FOLDER', bỏ qua tải/giải nén."
 else
 	if [ ! -f "$TARBALL" ]; then
-		echo "Tải rootfs, có thể mất một lúc tuỳ tốc độ mạng."
-		echo "⚠️  Tải qua HTTP (không có checksum để xác minh) từ localhost:8000."
+		log_step "Tải rootfs, có thể mất một lúc tuỳ tốc độ mạng."
 		wget -c "http://localhost:8000/ubuntu-rootfs-arm64.tar.gz" -O "$TARBALL"
 	fi
 	mkdir -p "$ROOTFS"
-	echo "Giải nén rootfs, vui lòng chờ."
+	log_step "Giải nén rootfs, vui lòng chờ."
 	if ! proot --link2symlink tar -xf "$TARBALL" -C "$ROOTFS"; then
-		echo "❌ Giải nén thất bại — rootfs có thể hỏng. Xoá '$ROOTFS' rồi thử lại."
+		log_err "Giải nén thất bại — rootfs có thể hỏng. Xoá '$ROOTFS' rồi thử lại."
 		exit 1
 	fi
 fi
 
 # === 3. Fake sysdata (giống proot-distro) ===
+log_step "Tạo fake /proc và /sys stubs"
 # Thư mục sysdata guest ghi được (/sdcard bind vào container), nên một phiên có
 # thể thay entry bằng symlink/hardlink trỏ file host; lần cài sau ghi xuyên qua
 # đó sẽ sửa file host. sysdata_own chỉ nhận file thường đúng 1 link (hardlink là
@@ -382,27 +402,15 @@ sysdata_clear uptime
 fake_uptime_line > "$SYSDATA_DIR/uptime"
 sysdata_write version 'Linux version 6.17.0-PRoot-Distro (proot@termux) (gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) #1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000'
 
-# === 3b. Stub namespace cho kernel thiếu pid/ipc/user ns (một số ROM MTK) ===
-# proot không tạo được namespace thật; stub chỉ là symlink treo để các lệnh kiểm
-# tra tồn tại/readlink (ls /proc/self/ns/pid) không báo lỗi. unshare --pid,
-# systemd, docker --pid vẫn cần kernel hỗ trợ thật.
-for _ns in pid ipc user; do
-	case "$_ns" in
-		pid)  _ns_ino=4026531836 ;;
-		ipc)  _ns_ino=4026531839 ;;
-		user) _ns_ino=4026531837 ;;
-	esac
-	sysdata_clear "ns_$_ns"
-	ln -s "$_ns:[$_ns_ino]" "$SYSDATA_DIR/ns_$_ns"
-done
-
 # === 4. /dev/shm là thư mục sibling (mode 1777), không phải <rootfs>/tmp ===
 # proot phân giải nguồn bind theo TÊN khi mount, sau khi mọi kiểm tra đã xong;
 # guest đổi <rootfs>/tmp thành symlink sẽ khiến phiên sau mount nhầm thư mục host.
+log_step "Tạo /dev/shm (thư mục sibling của rootfs)"
 mkdir -p "$SHM_DIR"
 chmod 1777 "$SHM_DIR"
 
 # === 5. /etc/hosts và /etc/resolv.conf (THAY THẾ, không append) ===
+log_step "Ghi /etc/hosts và /etc/resolv.conf"
 mkdir -p "$ROOTFS/etc"
 cat > "$ROOTFS/etc/hosts" << 'HSEOF'
 # IPv4.
@@ -425,6 +433,7 @@ nameserver 8.8.4.4
 RSEOF
 
 # === 6. Cấu hình dpkg / apt ===
+log_step "Cấu hình dpkg và apt"
 mkdir -p "$ROOTFS/etc/profile.d"
 mkdir -p "$ROOTFS/etc/dpkg/dpkg.cfg.d"
 echo 'force-unsafe-io' > "$ROOTFS/etc/dpkg/dpkg.cfg.d/unsafe-io"
@@ -435,6 +444,7 @@ APT::Install-Suggests "false";
 APEOF
 
 # === 7. chmod id files + đăng ký Android UID/GID (idempotent) ===
+log_step "Đăng ký Android UID/GID (aid_*)"
 # proot-distro chmod 0644 bốn file id để login đọc được passwd/group.
 for f in passwd shadow group gshadow; do
 	[ -f "$ROOTFS/etc/$f" ] && chmod 0644 "$ROOTFS/etc/$f"
@@ -481,6 +491,7 @@ for gid in $(id -G 2>/dev/null); do
 done
 
 # === 8. profile.d snippet (sinh động, giống proot-distro) ===
+log_step "Sinh profile.d snippet"
 # Login shell source /etc/profile nên mất biến do proot truyền; snippet này
 # re-export để `su - user` vẫn giữ. Bỏ qua biến per-session và proot-internal.
 LEGACY_SNIPPET="$ROOTFS/etc/profile.d/termux-prefix.sh"
@@ -491,7 +502,6 @@ PROFILE_PAIRS=(
 	"LANG=C.UTF-8"
 	"TZ=Asia/Ho_Chi_Minh"
 	"MOZ_FAKE_NO_SANDBOX=1"
-	"PULSE_SERVER=127.0.0.1"
 	"PD_CONTAINER=$FOLDER"
 	"container=proot-distro"
 )
@@ -520,7 +530,7 @@ chmod 644 "$SNIPPET"
 
 # === 9. Sinh launch script ===
 bin="start-ubuntu.sh"
-echo "Đang ghi launch script..."
+log_step "Sinh launch script ($bin)"
 # Heredoc dùng 'EOM' (không expand biến), nên các giá trị phụ thuộc môi trường
 # được ghi dưới dạng placeholder @FOLDER@/@TERMUX_PREFIX@/@TERMUX_HOME@ và
 # thay bằng sed ngay sau khi ghi.
@@ -550,7 +560,6 @@ mkdir -p "$SHM_DIR" && chmod 1777 "$SHM_DIR"
 
 UNAME_M="$(uname -m 2>/dev/null || echo aarch64)"
 
-pulseaudio --start 2>/dev/null || true
 unset LD_PRELOAD
 
 # --- env cho proot (đặt trong env của proot, không dùng env -i cho guest) ---
@@ -563,7 +572,6 @@ env+=(LANG=C.UTF-8)
 env+=(COLORTERM=truecolor)
 env+=(TZ=Asia/Ho_Chi_Minh)
 env+=(MOZ_FAKE_NO_SANDBOX=1)
-env+=(PULSE_SERVER=127.0.0.1)
 env+=(PROOT_L2S_DIR="$ROOTFS/.l2s")
 env+=(PROOT_NO_SECCOMP=1)
 # Identity: cho guest biết nó đang chạy ở đâu.
@@ -611,26 +619,6 @@ for _f in "entry_cap_last_cap:kernel/cap_last_cap" "inotify_max_user_watches:fs/
 	[ ! -r "/proc/sys/$_ppath" ] && p_args+=(--bind="$SYSDATA_DIR/sysctl_$_sname:/proc/sys/$_ppath")
 done
 p_args+=(--bind="$SYSDATA_DIR/sys_empty:/sys/fs/selinux")
-
-# Stub namespace khi kernel thiếu /proc/self/ns/{pid,ipc,user} (ROM MTK...).
-# Stub là symlink treo nên kiểm tra bằng -L (không phải -e), nếu không sẽ
-# không bao giờ bind được. proot không tạo namespace thật — chỉ đủ để lệnh
-# kiểm tra tồn tại/readlink khỏi báo lỗi.
-_missing_ns=()
-for _ns in pid ipc user; do
-	if [ ! -e "/proc/self/ns/$_ns" ]; then
-		if [ -L "$SYSDATA_DIR/ns_$_ns" ]; then
-			p_args+=(--bind="$SYSDATA_DIR/ns_$_ns:/proc/self/ns/$_ns")
-		else
-			_missing_ns+=("$_ns")
-		fi
-	fi
-done
-if [ "${#_missing_ns[@]}" -gt 0 ]; then
-	echo "WARNING: thiếu namespace và không có stub: ${_missing_ns[*]}. PID namespace không khả dụng (giới hạn kernel/proot)." >&2
-elif [ ! -e /proc/self/ns/pid ]; then
-	echo "NOTE: kernel thiếu pid/ipc/user ns; dùng stub tương thích (không cách ly PID thật). unshare -p/systemd/docker --pid sẽ lỗi." >&2
-fi
 
 # /proc/stat và /proc/uptime giả phải khớp /proc/cpuinfo khách đọc được (host
 # bind thẳng): Android tắt/mở core làm danh sách CPU đổi giữa các phiên, nên
@@ -731,32 +719,10 @@ sed -i \
 	-e "s|@TERMUX_PREFIX@|$_termux_prefix_esc|g" \
 	"$SCRIPT_DIR/$bin"
 
-# === 10. Pulseaudio (giống bản gốc, idempotent) ===
-echo "Cấu hình pulseaudio để có âm thanh trong distro."
-PA_DEFAULT="$TERMUX_USR/etc/pulse/default.pa"
-if [ -f "$PA_DEFAULT" ] && ! grep -q "module-native-protocol-tcp" "$PA_DEFAULT"; then
-	echo "load-module module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" >> "$PA_DEFAULT"
-	echo "Đã bật module pulseaudio TCP."
-else
-	echo "Module đã có hoặc thiếu default.pa — bỏ qua."
-fi
-
-PA_DAEMON="$TERMUX_USR/etc/pulse/daemon.conf"
-if [ -f "$PA_DAEMON" ] && ! grep -q "^exit-idle-time" "$PA_DAEMON"; then
-	echo "exit-idle-time = -1" >> "$PA_DAEMON"
-	echo "Đặt pulseaudio timeout = vô hạn."
-fi
-
-PA_CLIENT="$TERMUX_USR/etc/pulse/client.conf"
-if [ -f "$PA_CLIENT" ] && ! grep -q "^autospawn" "$PA_CLIENT"; then
-	echo "autospawn = no" >> "$PA_CLIENT"
-	echo "Đã tắt pulseaudio autospawn."
-fi
-
-# === 11. Hoàn tất ===
-echo "Sửa shebang cho $bin"
+# === 10. Hoàn tất ===
+log_step "Sửa shebang và cấp quyền chạy cho $bin"
 termux-fix-shebang "$SCRIPT_DIR/$bin"
 chmod +x "$SCRIPT_DIR/$bin"
-echo "Xoá tarball để tiết kiệm dung lượng"
+log_info "Xoá tarball để tiết kiệm dung lượng"
 rm -f "$TARBALL"
-echo "Bạn có thể chạy Ubuntu bằng: ./$bin"
+log_ok "Hoàn tất! Chạy Ubuntu bằng: ./$bin"
