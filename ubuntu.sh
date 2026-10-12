@@ -3,7 +3,8 @@
 # ubuntu.sh — dựng container Ubuntu rootless trên Termux (thủ công).
 #
 # Các bước setup hệ thống mô phỏng proot-distro:
-#   - fake /proc, /sys stubs trong thư mục sysdata/
+#   - fake /proc, /sys stubs trong thư mục sysdata/; /proc/stat và /proc/uptime
+#     sinh theo số CPU thật của máy, khớp /proc/cpuinfo khách đọc được
 #   - /dev/shm là thư mục sibling của rootfs (mode 1777), KHÔNG phải <rootfs>/tmp
 #   - /etc/resolv.conf và /etc/hosts được THAY THẾ (không append trùng)
 #   - chmod 0644 cho passwd/shadow/group/gshadow
@@ -80,34 +81,120 @@ else
 fi
 
 # === 3. Fake sysdata (giống proot-distro) ===
+# Thư mục sysdata guest ghi được (/sdcard bind vào container), nên một phiên có
+# thể thay entry bằng symlink/hardlink trỏ file host; lần cài sau ghi xuyên qua
+# đó sẽ sửa file host. sysdata_own chỉ nhận file thường đúng 1 link (hardlink là
+# file thứ hai cùng inode); sysdata_clear xoá mọi thứ khác trước khi ghi lại.
+sysdata_own() {
+	local path="$SYSDATA_DIR/$1"
+	[ -L "$path" ] && return 1
+	[ -f "$path" ] || return 1
+	[ "$(stat -c %h "$path" 2>/dev/null)" = "1" ]
+}
+
+# Xoá entry sysdata nếu không phải file do script này ghi; giữ nguyên nếu đúng.
+sysdata_clear() {
+	local path="$SYSDATA_DIR/$1"
+	sysdata_own "$1" && return 0
+	[ -e "$path" ] || [ -L "$path" ] || return 0
+	rm -rf "$path"
+}
+
+# Ghi entry sysdata một dòng sau khi đã loại entry lạ.
+sysdata_write() {
+	sysdata_clear "$1"
+	printf '%s\n' "$2" > "$SYSDATA_DIR/$1"
+}
+
+# Chính thư mục sysdata cũng có thể bị thay bằng symlink.
+[ -L "$SYSDATA_DIR" ] && rm -rf "$SYSDATA_DIR"
 mkdir -p "$SYSDATA_DIR/sys_empty"
 chmod 700 "$SYSDATA_DIR"
 
-printf '0.12 0.07 0.02 2/165 765\n' > "$SYSDATA_DIR/loadavg"
-printf '65534\n' > "$SYSDATA_DIR/sysctl_kernel_overflowuid"
-printf '65534\n' > "$SYSDATA_DIR/sysctl_kernel_overflowgid"
-printf '40\n' > "$SYSDATA_DIR/sysctl_entry_cap_last_cap"
-printf '4096\n' > "$SYSDATA_DIR/sysctl_inotify_max_user_watches"
+sysdata_write loadavg '0.12 0.07 0.02 2/165 765'
+sysdata_write sysctl_kernel_overflowuid '65534'
+sysdata_write sysctl_kernel_overflowgid '65534'
+sysdata_write sysctl_entry_cap_last_cap '40'
+sysdata_write sysctl_inotify_max_user_watches '4096'
 
-cat > "$SYSDATA_DIR/stat" << 'SYSEOF'
-cpu  1957 0 2877 93280 262 342 254 87 0 0
-cpu0 31 0 226 12027 82 10 4 9 0 0
-cpu1 45 0 664 11144 21 263 233 12 0 0
-cpu2 494 0 537 11283 27 10 3 8 0 0
-cpu3 359 0 234 11723 24 26 5 7 0 0
-cpu4 295 0 268 11772 10 12 2 12 0 0
-cpu5 270 0 251 11833 15 3 1 10 0 0
-cpu6 430 0 520 11386 30 8 1 12 0 0
-cpu7 30 0 172 12108 50 8 1 13 0 0
-intr 127541 38 290 0 0 0 0 4 0 1 0 0 25329 258 0 5777 277 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+# Bảng mẫu mỗi CPU: 10 cột bộ đếm của một dòng "cpuN" trong /proc/stat
+# (user nice system idle iowait irq softirq steal guest guest_nice), đơn vị
+# tick USER_HZ, mỗi CPU khoảng 120 giây trong tổng uptime 124 giây.
+cpu_rows=(
+	'31 0 226 12027 82 10 4 9 0 0'
+	'45 0 664 11144 21 263 233 12 0 0'
+	'494 0 537 11283 27 10 3 8 0 0'
+	'359 0 234 11723 24 26 5 7 0 0'
+	'295 0 268 11772 10 12 2 12 0 0'
+	'270 0 251 11833 15 3 1 10 0 0'
+	'430 0 520 11386 30 8 1 12 0 0'
+	'30 0 172 12108 50 8 1 13 0 0'
+)
+FAKE_UPTIME_SECONDS='124.08'
+
+# In danh sách id CPU từ /proc/cpuinfo (Android tắt core thì id bị khuyết,
+# không đánh số lại); không đọc được hoặc thiếu dòng "processor" thì lùi về nproc.
+host_cpu_ids() {
+	local cpu_ids cpu_count
+	cpu_ids="$(sed -n 's/^processor[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' /proc/cpuinfo 2>/dev/null)"
+	if [ -z "$cpu_ids" ]; then
+		cpu_count="$(nproc 2>/dev/null || echo 1)"
+		awk -v count="$cpu_count" 'BEGIN { for (i = 0; i < count; i++) print i }'
+	else
+		printf '%s\n' "$cpu_ids"
+	fi
+}
+
+# In nội dung /proc/uptime khớp với /proc/stat giả: trường 2 là tổng thời gian
+# idle của mọi CPU, lấy từ cùng bảng mẫu.
+fake_uptime_line() {
+	local cpu_id cpu_index idle_ticks row
+	cpu_index=0
+	idle_ticks=0
+	for cpu_id in $(host_cpu_ids); do
+		row="${cpu_rows[$((cpu_index % ${#cpu_rows[@]}))]}"
+		read -r _ _ _ idle _ _ _ _ _ _ <<< "$row"
+		idle_ticks=$((idle_ticks + idle))
+		cpu_index=$((cpu_index + 1))
+	done
+	printf '%s %d.%02d\n' "$FAKE_UPTIME_SECONDS" "$((idle_ticks / 100))" "$((idle_ticks % 100))"
+}
+
+# In nội dung /proc/stat: một dòng "cpuN" cho mỗi CPU máy có (quá 8 thì xoay
+# vòng bảng mẫu), dòng "cpu" là tổng từng cột như kernel — công cụ đối chiếu
+# hai dòng này luôn thấy khớp.
+fake_stat() {
+	local cpu_id cpu_index row col cols
+	local -a totals=(0 0 0 0 0 0 0 0 0 0)
+	cpu_index=0
+	for cpu_id in $(host_cpu_ids); do
+		row="${cpu_rows[$((cpu_index % ${#cpu_rows[@]}))]}"
+		read -ra cols <<< "$row"
+		for col in "${!cols[@]}"; do
+			totals[$col]=$((totals[$col] + cols[col]))
+		done
+		cpu_index=$((cpu_index + 1))
+	done
+	printf 'cpu  %s\n' "${totals[*]}"
+	cpu_index=0
+	for cpu_id in $(host_cpu_ids); do
+		printf 'cpu%s %s\n' "$cpu_id" "${cpu_rows[$((cpu_index % ${#cpu_rows[@]}))]}"
+		cpu_index=$((cpu_index + 1))
+	done
+}
+
+sysdata_clear stat.tail
+cat > "$SYSDATA_DIR/stat.tail" << 'STATTAIL'
+intr 127541 38 290 0 0 0 0 4 0 1 0 0 25329 258 0 5777 277 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 ctxt 140223
 btime 1680020856
 processes 772
 procs_running 2
 procs_blocked 0
 softirq 75663 0 5903 6 25375 10774 0 243 11685 0 21677
-SYSEOF
+STATTAIL
 
+sysdata_clear vmstat
 cat > "$SYSDATA_DIR/vmstat" << 'VSEOF'
 nr_free_pages 1743136
 nr_zone_inactive_anon 179281
@@ -289,8 +376,25 @@ direct_map_level3_splits 0
 nr_unstable 0
 VSEOF
 
-printf '124.08 932.80\n' > "$SYSDATA_DIR/uptime"
-printf 'Linux version 6.17.0-PRoot-Distro (proot@termux) (gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) #1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000\n' > "$SYSDATA_DIR/version"
+sysdata_clear stat
+{ fake_stat; cat "$SYSDATA_DIR/stat.tail"; } > "$SYSDATA_DIR/stat"
+sysdata_clear uptime
+fake_uptime_line > "$SYSDATA_DIR/uptime"
+sysdata_write version 'Linux version 6.17.0-PRoot-Distro (proot@termux) (gcc (GCC) 13.3.0, GNU ld (GNU Binutils) 2.42) #1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000'
+
+# === 3b. Stub namespace cho kernel thiếu pid/ipc/user ns (một số ROM MTK) ===
+# proot không tạo được namespace thật; stub chỉ là symlink treo để các lệnh kiểm
+# tra tồn tại/readlink (ls /proc/self/ns/pid) không báo lỗi. unshare --pid,
+# systemd, docker --pid vẫn cần kernel hỗ trợ thật.
+for _ns in pid ipc user; do
+	case "$_ns" in
+		pid)  _ns_ino=4026531836 ;;
+		ipc)  _ns_ino=4026531839 ;;
+		user) _ns_ino=4026531837 ;;
+	esac
+	sysdata_clear "ns_$_ns"
+	ln -s "$_ns:[$_ns_ino]" "$SYSDATA_DIR/ns_$_ns"
+done
 
 # === 4. /dev/shm là thư mục sibling (mode 1777), không phải <rootfs>/tmp ===
 # proot phân giải nguồn bind theo TÊN khi mount, sau khi mọi kiểm tra đã xong;
@@ -508,6 +612,73 @@ for _f in "entry_cap_last_cap:kernel/cap_last_cap" "inotify_max_user_watches:fs/
 done
 p_args+=(--bind="$SYSDATA_DIR/sys_empty:/sys/fs/selinux")
 
+# Stub namespace khi kernel thiếu /proc/self/ns/{pid,ipc,user} (ROM MTK...).
+# Stub là symlink treo nên kiểm tra bằng -L (không phải -e), nếu không sẽ
+# không bao giờ bind được. proot không tạo namespace thật — chỉ đủ để lệnh
+# kiểm tra tồn tại/readlink khỏi báo lỗi.
+_missing_ns=()
+for _ns in pid ipc user; do
+	if [ ! -e "/proc/self/ns/$_ns" ]; then
+		if [ -L "$SYSDATA_DIR/ns_$_ns" ]; then
+			p_args+=(--bind="$SYSDATA_DIR/ns_$_ns:/proc/self/ns/$_ns")
+		else
+			_missing_ns+=("$_ns")
+		fi
+	fi
+done
+if [ "${#_missing_ns[@]}" -gt 0 ]; then
+	echo "WARNING: thiếu namespace và không có stub: ${_missing_ns[*]}. PID namespace không khả dụng (giới hạn kernel/proot)." >&2
+elif [ ! -e /proc/self/ns/pid ]; then
+	echo "NOTE: kernel thiếu pid/ipc/user ns; dùng stub tương thích (không cách ly PID thật). unshare -p/systemd/docker --pid sẽ lỗi." >&2
+fi
+
+# /proc/stat và /proc/uptime giả phải khớp /proc/cpuinfo khách đọc được (host
+# bind thẳng): Android tắt/mở core làm danh sách CPU đổi giữa các phiên, nên
+# hai file này được sinh lại mỗi lần login theo số CPU hiện tại. Bảng mẫu và
+# cách tính giống lúc cài; host đã có file thật thì không đụng.
+if [ ! -r /proc/stat ] && [ -f "$SYSDATA_DIR/stat.tail" ] && [ ! -L "$SYSDATA_DIR/stat.tail" ]; then
+	_fake_cpu_rows=(
+		'31 0 226 12027 82 10 4 9 0 0'
+		'45 0 664 11144 21 263 233 12 0 0'
+		'494 0 537 11283 27 10 3 8 0 0'
+		'359 0 234 11723 24 26 5 7 0 0'
+		'295 0 268 11772 10 12 2 12 0 0'
+		'270 0 251 11833 15 3 1 10 0 0'
+		'430 0 520 11386 30 8 1 12 0 0'
+		'30 0 172 12108 50 8 1 13 0 0'
+	)
+	_fake_cpu_ids="$(sed -n 's/^processor[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' /proc/cpuinfo 2>/dev/null)"
+	if [ -z "$_fake_cpu_ids" ]; then
+		_fake_cpu_count="$(nproc 2>/dev/null || echo 1)"
+		_fake_cpu_ids="$(awk -v count="$_fake_cpu_count" 'BEGIN { for (i = 0; i < count; i++) print i }')"
+	fi
+	_fake_idle=0
+	_fake_totals=(0 0 0 0 0 0 0 0 0 0)
+	_fake_index=0
+	for _fake_id in $_fake_cpu_ids; do
+		_fake_row="${_fake_cpu_rows[$((_fake_index % ${#_fake_cpu_rows[@]}))]}"
+		read -r _u _n _s _idle _w _ir _sq _st _g _gn <<< "$_fake_row"
+		_fake_idle=$((_fake_idle + _idle))
+		read -ra _fake_cols <<< "$_fake_row"
+		for _fake_col in "${!_fake_cols[@]}"; do
+			_fake_totals[_fake_col]=$((_fake_totals[_fake_col] + _fake_cols[_fake_col]))
+		done
+		_fake_index=$((_fake_index + 1))
+	done
+	_fake_tmp="$SYSDATA_DIR/.stat.$$.tmp"
+	{
+		printf 'cpu  %s\n' "${_fake_totals[*]}"
+		_fake_index=0
+		for _fake_id in $_fake_cpu_ids; do
+			printf 'cpu%s %s\n' "$_fake_id" "${_fake_cpu_rows[$((_fake_index % ${#_fake_cpu_rows[@]}))]}"
+			_fake_index=$((_fake_index + 1))
+		done
+		cat "$SYSDATA_DIR/stat.tail"
+	} > "$_fake_tmp" && mv -f "$_fake_tmp" "$SYSDATA_DIR/stat"
+	_fake_tmp="$SYSDATA_DIR/.uptime.$$.tmp"
+	printf '124.08 %d.%02d\n' "$((_fake_idle / 100))" "$((_fake_idle % 100))" > "$_fake_tmp" && mv -f "$_fake_tmp" "$SYSDATA_DIR/uptime"
+fi
+
 # Dalvik/ART caches.
 for _d in /data/app /data/dalvik-cache /data/misc/apexdata/com.android.art/dalvik-cache; do
 	[ -d "$_d" ] && [ -x "$_d" ] && p_args+=(--bind="$_d")
@@ -530,14 +701,14 @@ for _p in /apex /odm /product /system /system_ext /vendor /linkerconfig/ld.confi
 done
 # Termux app paths.
 [ -d @TERMUX_PREFIX@/../apps ] && p_args+=(--bind=@TERMUX_PREFIX@/../apps)
-p_args+=(--bind=@TERMUX_PREFIX@/../cache)
+p_args+=(--bind=@TERMUX_PREFIX@/../../cache)
 p_args+=(--bind=@TERMUX_HOME@)
 p_args+=(--bind=@TERMUX_PREFIX@)
 # /dev/shm = thư mục sibling (KHÔNG phải $ROOTFS/tmp).
 p_args+=(--bind="$SHM_DIR:/dev/shm")
 # Kernel release (định dạng proot).
 HNAME=wizk
-kr="\\Linux\\${HNAME}\\6.6.89-wizkvn-100067\\#1 SMP PREEMPT Sat Jul 19 00:22:46 +07 2026\\${UNAME_M}\\localdomain\\-1\\"
+kr="\\Linux\\${HNAME}\\3.6.67-wizkmodz-100067\\#1 SMP PREEMPT $(LC_ALL=C date)\\${UNAME_M}\\localdomain\\-1\\"
 p_args+=(--kernel-release="${kr}")
 p_args+=(/bin/bash --login)
 
