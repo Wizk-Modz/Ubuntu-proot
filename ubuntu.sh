@@ -22,7 +22,8 @@ FOLDER="SysUbuntu"
 ROOTFS="$SCRIPT_DIR/$FOLDER"
 SYSDATA_DIR="$SCRIPT_DIR/$FOLDER.sysdata"
 SHM_DIR="$SCRIPT_DIR/$FOLDER.shm"
-TARBALL="$SCRIPT_DIR/ubuntu-rootfs.tar.gz"
+TARBALL="$SCRIPT_DIR/ubuntu-rootfs-arm64.tar.gz"
+TARBALL_SHA256="2113f8d7eb32748b14581824c1b94cea9ed9a08456312a2e94eddd522d01b927"
 
 # --- Log có màu, tiền tố [*] / [+] / [!] ---
 # Màu tự tắt khi đầu ra không phải terminal hoặc khi đặt NO_COLOR.
@@ -55,7 +56,7 @@ env_value() {
 # === 1. Kiểm tra package bắt buộc ===
 # getent KHÔNG bắt buộc: Termux không cung cấp nó (util-linux không kèm),
 # và nó chỉ dùng để đặt tên nhóm — `id -G` đã phủ mọi GID bằng số.
-REQUIRED_CMDS=(wget proot tar termux-fix-shebang)
+REQUIRED_CMDS=(wget proot tar termux-fix-shebang sha256sum)
 missing=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
 	command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
@@ -69,6 +70,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
 	for cmd in "${missing[@]}"; do
 		case "$cmd" in
 			termux-fix-shebang) pkgs+=("termux-tools") ;;
+			sha256sum)          pkgs+=("coreutils") ;;
 			*)                  pkgs+=("$cmd") ;;
 		esac
 	done
@@ -89,8 +91,27 @@ if [ -d "$ROOTFS" ]; then
 else
 	if [ ! -f "$TARBALL" ]; then
 		log_step "Tải rootfs, có thể mất một lúc tuỳ tốc độ mạng."
-		wget -c "http://localhost:8000/ubuntu-rootfs-arm64.tar.gz" -O "$TARBALL"
+		if ! wget -c "http://localhost:8000/ubuntu-rootfs-arm64.tar.gz" -O "$TARBALL"; then
+			log_err "Tải rootfs thất bại."
+			exit 1
+		fi
 	fi
+
+	if [ ! -f "$TARBALL" ]; then
+		log_err "Không tìm thấy file rootfs: $TARBALL"
+		exit 1
+	fi
+
+	log_step "Kiểm tra checksum SHA-256 của rootfs"
+	actual_sha256="$(sha256sum "$TARBALL" 2>/dev/null | awk '{print $1}')"
+	if [ "$actual_sha256" != "$TARBALL_SHA256" ]; then
+		log_err "Checksum SHA-256 không khớp! File có thể bị hỏng."
+		log_err "Mong muốn: $TARBALL_SHA256"
+		log_err "Thực tế:   $actual_sha256"
+		exit 1
+	fi
+	log_ok "Xác minh SHA-256 thành công."
+
 	mkdir -p "$ROOTFS"
 	log_step "Giải nén rootfs, vui lòng chờ."
 	if ! proot --link2symlink tar -xf "$TARBALL" -C "$ROOTFS"; then
