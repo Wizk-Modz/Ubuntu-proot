@@ -1,4 +1,4 @@
-# FFUNUNTU: Ubuntu Rootless trên Termux
+# Ubuntu Proot: Ubuntu Rootless trên Termux
 
 FFUNUNTU cung cấp giải pháp cài đặt và vận hành môi trường Ubuntu (ARM64) rootless trên Android thông qua Termux và PRoot. Hệ thống thiết lập đầy đủ stubs hệ thống, ánh xạ quyền Android và tối ưu hóa cấu hình cho môi trường di động.
 
