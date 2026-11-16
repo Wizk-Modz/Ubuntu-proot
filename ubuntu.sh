@@ -56,7 +56,7 @@ env_value() {
 # === 1. Kiểm tra package bắt buộc ===
 # getent KHÔNG bắt buộc: Termux không cung cấp nó (util-linux không kèm),
 # và nó chỉ dùng để đặt tên nhóm — `id -G` đã phủ mọi GID bằng số.
-REQUIRED_CMDS=(wget proot tar termux-fix-shebang sha256sum)
+REQUIRED_CMDS=(wcurl proot tar termux-fix-shebang sha256sum)
 missing=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
 	command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
@@ -71,6 +71,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
 		case "$cmd" in
 			termux-fix-shebang) pkgs+=("termux-tools") ;;
 			sha256sum)          pkgs+=("coreutils") ;;
+			wcurl)              pkgs+=("libcurl") ;;
 			*)                  pkgs+=("$cmd") ;;
 		esac
 	done
@@ -91,7 +92,8 @@ if [ -d "$ROOTFS" ]; then
 else
 	if [ ! -f "$TARBALL" ]; then
 		log_step "Tải rootfs, có thể mất một lúc tuỳ tốc độ mạng."
-		if ! wget -c "http://localhost:8000/ubuntu-rootfs-arm64.tar.gz" -O "$TARBALL"; then
+		if ! wcurl -o "$TARBALL" --curl-options='--clobber -C -' \
+			"http://localhost:8000/ubuntu-rootfs-arm64.tar.gz"; then
 			log_err "Tải rootfs thất bại."
 			exit 1
 		fi

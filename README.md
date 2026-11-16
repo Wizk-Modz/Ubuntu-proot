@@ -26,7 +26,7 @@ FFUNUNTU cung cấp giải pháp cài đặt và vận hành môi trường Ubun
 - Các gói công cụ bắt buộc trên Termux:
   - `proot`
   - `tar`
-  - `wget`
+  - `wcurl` (đi kèm gói `libcurl`)
   - `coreutils` (cung cấp lệnh `sha256sum`)
   - `termux-tools` (cung cấp lệnh `termux-fix-shebang`)
 
